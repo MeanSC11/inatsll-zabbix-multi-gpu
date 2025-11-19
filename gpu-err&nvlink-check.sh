@@ -14,7 +14,7 @@ SCRIPTS_DIR="/etc/zabbix/scripts"
 AGENT_D_DIR="/etc/zabbix/zabbix_agent2.d"
 CONF_FILE="${AGENT_D_DIR}/gpu_err_check.conf"
 
-# ตรวจว่ามี nvidia-smi ไหม
+# check nvidia-smi
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "ERROR: nvidia-smi not found in PATH"
   exit 1
@@ -81,7 +81,7 @@ EOF
 chmod +x "${NVLINK_ERR_SUM_SCRIPT}"
 
 ########################################
-# 3) เขียน UserParameters ให้ Zabbix agent2
+# 3) write UserParameters for Zabbix agent2
 ########################################
 echo "[*] Writing Zabbix UserParameters: ${CONF_FILE}"
 mkdir -p "${AGENT_D_DIR}"
