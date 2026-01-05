@@ -3,19 +3,20 @@ set -euo pipefail
 
 # -----------------------------------------
 # install-zbx-gpu.sh
-# - Base from plambe/zabbix-nvidia-smi-multi-gpu
-# - Idempotent: do NOT overwrite existing files
-#   (only append missing lines / create missing files)
-# - Adds gpu.unknown_error UserParameter (count of "Unknown Error" lines)
+# - Base files are vendored in THIS repo under ./raw/ (stable, no upstream path break)
+# - (Optional) still clones plambe repo for reference only; failure to clone will NOT break install
+# - Idempotent: do NOT overwrite existing files (only create missing files / append missing keys)
+# - Adds gpu.unknown_error UserParameter (count of "Unknown Error" lines from nvidia-smi -L)
 # - Keeps/ensures nvlink + gpu err keys
 # - If userparameter file already exists, MERGE missing UserParameter keys
-#   from base raw/userparameter_nvidia-smi.conf (key-based, append-only)
+#   from base ./raw/userparameter_nvidia-smi.conf (key-based, append-only)
 # -----------------------------------------
 
 PLAMBE_REPO_URL="${PLAMBE_REPO_URL:-https://github.com/plambe/zabbix-nvidia-smi-multi-gpu.git}"
 TMPDIR="${TMPDIR:-/tmp}"
 CLONE_DIR=""
 QUIET="${QUIET:-0}"
+CLONE_PLAMBE="${CLONE_PLAMBE:-1}"  # set 0 to skip cloning upstream reference
 
 log() {
   if [[ "$QUIET" != "1" ]]; then
@@ -127,11 +128,24 @@ merge_base_userparams() {
   done < "$base_file"
 }
 
-clone_plambe_repo() {
-  have_cmd git || die "git is required. Please install git."
+clone_plambe_repo_best_effort() {
+  # Upstream clone is optional reference; should never break install.
+  if [[ "$CLONE_PLAMBE" != "1" ]]; then
+    log "Skip cloning upstream (CLONE_PLAMBE=0)"
+    return 0
+  fi
+
+  if ! have_cmd git; then
+    log "WARN: git not found; skip cloning upstream reference."
+    return 0
+  fi
+
   CLONE_DIR="${TMPDIR%/}/zbx-nvidia-smi-multi-gpu.$(date +%s)"
-  log "Cloning base repo: $PLAMBE_REPO_URL -> $CLONE_DIR"
-  git clone --depth 1 "$PLAMBE_REPO_URL" "$CLONE_DIR" >/dev/null 2>&1 || die "git clone failed"
+  log "Cloning upstream reference: $PLAMBE_REPO_URL -> $CLONE_DIR"
+  if ! git clone --depth 1 "$PLAMBE_REPO_URL" "$CLONE_DIR" >/dev/null 2>&1; then
+    log "WARN: git clone upstream failed; continuing with vendored ./raw files."
+    CLONE_DIR=""
+  fi
 }
 
 cleanup() {
@@ -167,7 +181,6 @@ warn_if_not_included() {
   local d
   d="$(dirname "$userparam_path")"
 
-  # Check common config files for Include pointing to this directory
   local cfgs=(
     "/etc/zabbix/zabbix_agent2.conf"
     "/etc/zabbix/zabbix_agentd.conf"
@@ -178,13 +191,6 @@ warn_if_not_included() {
   local found=0
   for c in "${cfgs[@]}"; do
     [[ -f "$c" ]] || continue
-    if grep -Eq "^[[:space:]]*Include[[:space:]]*=${d//\//\\/}/\*\.conf" "$c" \
-      || grep -Eq "^[[:space:]]*Include[[:space:]]*=${d//\//\\/}/\*\.conf\.d" "$c" \
-      || grep -Eq "^[[:space:]]*Include[[:space:]]*=${d//\//\\/}/\*\.conf" "$c"; then
-      found=1
-      break
-    fi
-    # Also accept Include=/etc/zabbix/zabbix_agent*.d/*.conf broadly
     if grep -Eq "^[[:space:]]*Include[[:space:]]*=/etc/zabbix/zabbix_agent(d|2)\.d/\*\.conf" "$c"; then
       found=1
       break
@@ -200,16 +206,22 @@ warn_if_not_included() {
 main() {
   require_root
   trap cleanup EXIT
-  clone_plambe_repo
 
-  # Paths from base repo
-  local base_get_gpus="${CLONE_DIR}/raw/get_gpus_info.sh"
-  local base_userparam="${CLONE_DIR}/raw/userparameter_nvidia-smi.conf"
+  # Determine script directory (this repo)
+  local SELF_DIR
+  SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-  [[ -f "$base_get_gpus" ]] || die "Base file missing: $base_get_gpus"
-  [[ -f "$base_userparam" ]] || die "Base file missing: $base_userparam"
+  # Base files from THIS repo (vendored, stable)
+  local base_get_gpus="${SELF_DIR}/raw/get_gpus_info.sh"
+  local base_userparam="${SELF_DIR}/raw/userparameter_nvidia-smi.conf"
 
-  # Target locations (as per base repo convention)
+  [[ -f "$base_get_gpus" ]] || die "Base file missing in this repo: $base_get_gpus"
+  [[ -f "$base_userparam" ]] || die "Base file missing in this repo: $base_userparam"
+
+  # Optional upstream clone (reference only; should not break)
+  clone_plambe_repo_best_effort
+
+  # Target locations
   ensure_dir "/etc/zabbix/scripts"
   ensure_dir "/usr/local/bin"
 
@@ -217,6 +229,7 @@ main() {
   install_file_if_missing "$base_get_gpus" "/etc/zabbix/scripts/get_gpus_info.sh" "0755"
 
   # 2) Ensure GPU error check script exists (create if missing; never overwrite)
+  # NOTE: Your existing configs often reference /usr/local/bin/check_gpu_err_simple.sh
   if [[ ! -f "/usr/local/bin/check_gpu_err_simple.sh" ]]; then
     log "Create /usr/local/bin/check_gpu_err_simple.sh (missing)."
     cat > /usr/local/bin/check_gpu_err_simple.sh <<'EOF'
@@ -248,10 +261,10 @@ EOF
 
   # If file doesn't exist, seed it from base repo raw/userparameter_nvidia-smi.conf
   if [[ ! -f "$userparam_path" ]]; then
-    log "Seed userparameter file from base repo: $userparam_path"
+    log "Seed userparameter file from this repo: $userparam_path"
     install -m 0644 "$base_userparam" "$userparam_path"
   else
-    log "Userparameter file exists; will merge missing UserParameter keys from base: $userparam_path"
+    log "Userparameter file exists; will merge missing UserParameter keys from this repo base: $userparam_path"
     merge_base_userparams "$base_userparam" "$userparam_path"
   fi
 
@@ -268,6 +281,8 @@ EOF
     '^UserParameter=nvidia\.gpu\.error,' \
     "UserParameter=nvidia.gpu.error,/usr/local/bin/check_gpu_err_simple.sh"
 
+  # Keep backward compat with your existing nvlink scripts if already present;
+  # but also ensure the simple nvlink status key exists.
   ensure_line_present \
     "$userparam_path" \
     '^UserParameter=gpu\.nvlink\.status,' \
