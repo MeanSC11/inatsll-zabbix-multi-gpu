@@ -6,8 +6,10 @@ set -euo pipefail
 # - Base from plambe/zabbix-nvidia-smi-multi-gpu
 # - Idempotent: do NOT overwrite existing files
 #   (only append missing lines / create missing files)
-# - Add gpu.unknown_error UserParameter (count)
-# - Keep nvlink + gpu err checks (original style)
+# - Adds gpu.unknown_error UserParameter (count of "Unknown Error" lines)
+# - Keeps/ensures nvlink + gpu err keys
+# - If userparameter file already exists, MERGE missing UserParameter keys
+#   from base raw/userparameter_nvidia-smi.conf (key-based, append-only)
 # -----------------------------------------
 
 PLAMBE_REPO_URL="${PLAMBE_REPO_URL:-https://github.com/plambe/zabbix-nvidia-smi-multi-gpu.git}"
@@ -79,7 +81,7 @@ install_file_if_missing() {
   install -m "$mode" "$src" "$dst"
 }
 
-# Ensure exact line exists; match via regex (so not duplicated)
+# Ensure exact key exists; match via regex (so not duplicated)
 ensure_line_present() {
   local file="$1"
   local match_regex="$2"
@@ -94,22 +96,35 @@ ensure_line_present() {
   printf "%s\n" "$line" >> "$file"
 }
 
-# Ensure file exists (touch), without overwriting
-ensure_file_exists() {
-  local file="$1"
-  local header_comment="${2:-}"
+# Merge base userparameters into existing file:
+# - Append ONLY UserParameter lines
+# - Key-based detection: do not duplicate keys that already exist
+# - Never overwrite or edit existing lines
+merge_base_userparams() {
+  local base_file="$1"
+  local target_file="$2"
 
-  if [[ -f "$file" ]]; then
-    return 0
-  fi
+  [[ -f "$base_file" ]] || die "Base userparameter file not found: $base_file"
+  [[ -f "$target_file" ]] || die "Target userparameter file not found: $target_file"
 
-  log "Create new file: $file"
-  touch "$file"
-  chmod 0644 "$file"
+  local line key key_re
+  while IFS= read -r line; do
+    [[ "$line" =~ ^UserParameter= ]] || continue
 
-  if [[ -n "$header_comment" ]]; then
-    printf "%s\n" "$header_comment" >> "$file"
-  fi
+    # Key is "UserParameter=xxxx" part before the first comma
+    key="$(printf '%s' "$line" | cut -d',' -f1)"   # e.g. UserParameter=gpu.power[*]
+
+    # Escape regex metacharacters for safe grep
+    key_re="$(printf '%s\n' "$key" | sed 's/[][\.^$*+?(){}|/]/\\&/g')"
+
+    # If key exists in target, skip
+    if grep -Eq "^${key_re}," "$target_file"; then
+      continue
+    fi
+
+    log "Merge missing key: $key"
+    printf "%s\n" "$line" >> "$target_file"
+  done < "$base_file"
 }
 
 clone_plambe_repo() {
@@ -117,6 +132,12 @@ clone_plambe_repo() {
   CLONE_DIR="${TMPDIR%/}/zbx-nvidia-smi-multi-gpu.$(date +%s)"
   log "Cloning base repo: $PLAMBE_REPO_URL -> $CLONE_DIR"
   git clone --depth 1 "$PLAMBE_REPO_URL" "$CLONE_DIR" >/dev/null 2>&1 || die "git clone failed"
+}
+
+cleanup() {
+  if [[ -n "${CLONE_DIR:-}" && -d "$CLONE_DIR" ]]; then
+    rm -rf "$CLONE_DIR" || true
+  fi
 }
 
 # Restart agent (agent2 preferred if exists)
@@ -140,8 +161,45 @@ restart_zabbix_agent() {
   fi
 }
 
+# Best-effort check: warn if Include dirs are not present in main config
+warn_if_not_included() {
+  local userparam_path="$1"
+  local d
+  d="$(dirname "$userparam_path")"
+
+  # Check common config files for Include pointing to this directory
+  local cfgs=(
+    "/etc/zabbix/zabbix_agent2.conf"
+    "/etc/zabbix/zabbix_agentd.conf"
+    "/etc/zabbix/agent2.conf"
+    "/etc/zabbix/agentd.conf"
+  )
+
+  local found=0
+  for c in "${cfgs[@]}"; do
+    [[ -f "$c" ]] || continue
+    if grep -Eq "^[[:space:]]*Include[[:space:]]*=${d//\//\\/}/\*\.conf" "$c" \
+      || grep -Eq "^[[:space:]]*Include[[:space:]]*=${d//\//\\/}/\*\.conf\.d" "$c" \
+      || grep -Eq "^[[:space:]]*Include[[:space:]]*=${d//\//\\/}/\*\.conf" "$c"; then
+      found=1
+      break
+    fi
+    # Also accept Include=/etc/zabbix/zabbix_agent*.d/*.conf broadly
+    if grep -Eq "^[[:space:]]*Include[[:space:]]*=/etc/zabbix/zabbix_agent(d|2)\.d/\*\.conf" "$c"; then
+      found=1
+      break
+    fi
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    log "WARN: Could not confirm agent Include for: $d/*.conf"
+    log "      If gpu.unknown_error shows 'Not supported', verify Include=... in zabbix_agent*.conf"
+  fi
+}
+
 main() {
   require_root
+  trap cleanup EXIT
   clone_plambe_repo
 
   # Paths from base repo
@@ -158,9 +216,7 @@ main() {
   # 1) Install get_gpus_info.sh ONLY if missing
   install_file_if_missing "$base_get_gpus" "/etc/zabbix/scripts/get_gpus_info.sh" "0755"
 
-  # 2) Ensure GPU error check script exists if referenced by existing config
-  #    We keep original key name in config (nvidia.gpu.error) but script path may vary.
-  #    If user already has /usr/local/bin/check_gpu_err_simple.sh -> do nothing.
+  # 2) Ensure GPU error check script exists (create if missing; never overwrite)
   if [[ ! -f "/usr/local/bin/check_gpu_err_simple.sh" ]]; then
     log "Create /usr/local/bin/check_gpu_err_simple.sh (missing)."
     cat > /usr/local/bin/check_gpu_err_simple.sh <<'EOF'
@@ -185,7 +241,7 @@ EOF
     log "Keep existing: /usr/local/bin/check_gpu_err_simple.sh"
   fi
 
-  # 3) Install/update userparameter file (IDEMPOTENT)
+  # 3) Install/update userparameter file (IDEMPOTENT + merge)
   local userparam_path
   userparam_path="$(detect_userparam_path)"
   ensure_dir "$(dirname "$userparam_path")"
@@ -195,18 +251,18 @@ EOF
     log "Seed userparameter file from base repo: $userparam_path"
     install -m 0644 "$base_userparam" "$userparam_path"
   else
-    log "Userparameter file exists; will only append missing lines: $userparam_path"
+    log "Userparameter file exists; will merge missing UserParameter keys from base: $userparam_path"
+    merge_base_userparams "$base_userparam" "$userparam_path"
   fi
 
-  # 4) Ensure required lines exist (without overwriting)
+  # 4) Ensure required lines exist (append-only)
   # ---- Add unknown error counter (requested) ----
   ensure_line_present \
     "$userparam_path" \
     '^UserParameter=gpu\.unknown_error,' \
     "UserParameter=gpu.unknown_error,/usr/bin/nvidia-smi -L 2>&1 | grep -c 'Unknown Error'"
 
-  # ---- Ensure original GPU err + nvlink keys exist (per your existing convention) ----
-  # If already present, keep.
+  # ---- Ensure original GPU err + nvlink keys exist ----
   ensure_line_present \
     "$userparam_path" \
     '^UserParameter=nvidia\.gpu\.error,' \
@@ -219,6 +275,9 @@ EOF
 
   # 5) Permissions sanity
   chmod 0644 "$userparam_path" || true
+
+  # Optional warning about include paths
+  warn_if_not_included "$userparam_path"
 
   # 6) Restart agent to apply new UserParameter(s)
   restart_zabbix_agent
